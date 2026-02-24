@@ -24,19 +24,19 @@ from models import WideResNet, ResNet20, convert_to_bitnet
 # Config
 # =============================================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NUM_WORKERS = 2
+NUM_WORKERS = 4
 DATA_DIR = "./data"
 SAVE_DIR = "./checkpoints"
 
 # Teacher training
 TEACHER_EPOCHS = 200
-TEACHER_LR = 0.1
-TEACHER_BATCH = 128
+TEACHER_LR = 0.4
+TEACHER_BATCH = 512
 
 # Distillation
 DISTILL_EPOCHS = 200
-DISTILL_LR = 0.1
-DISTILL_BATCH = 128
+DISTILL_LR = 0.4
+DISTILL_BATCH = 512
 DISTILL_T = 4.0      # Temperature
 DISTILL_ALPHA = 0.7   # KL weight
 
@@ -48,7 +48,7 @@ PRUNE_LR = 0.01
 # QAT (1.58bit)
 QAT_EPOCHS = 50
 QAT_LR = 0.005
-QAT_BATCH = 128
+QAT_BATCH = 512
 
 
 # =============================================================================
@@ -113,9 +113,11 @@ def count_nonzero_parameters(model):
 
 def model_size_mb(model):
     """Model size in MB (state_dict on disk)."""
-    torch.save(model.state_dict(), "/tmp/_tmp_model.pt")
-    size = os.path.getsize("/tmp/_tmp_model.pt") / (1024 * 1024)
-    os.remove("/tmp/_tmp_model.pt")
+    import tempfile
+    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_model.pt")
+    torch.save(model.state_dict(), tmp_path)
+    size = os.path.getsize(tmp_path) / (1024 * 1024)
+    os.remove(tmp_path)
     return size
 
 
@@ -173,15 +175,14 @@ def train_teacher(trainloader, testloader):
         scheduler.step()
 
         train_acc = 100.0 * correct / total
-        if epoch % 10 == 0 or epoch == 1:
-            test_acc = evaluate(model, testloader)
-            print(f"  Epoch {epoch:3d}/{TEACHER_EPOCHS} | "
-                  f"Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | "
-                  f"LR: {scheduler.get_last_lr()[0]:.5f}")
-            if test_acc > best_acc:
-                best_acc = test_acc
-                os.makedirs(SAVE_DIR, exist_ok=True)
-                torch.save(model.state_dict(), os.path.join(SAVE_DIR, "teacher_best.pt"))
+        test_acc = evaluate(model, testloader)
+        print(f"  Epoch {epoch:3d}/{TEACHER_EPOCHS} | "
+              f"Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | "
+              f"LR: {scheduler.get_last_lr()[0]:.5f}")
+        if test_acc > best_acc:
+            best_acc = test_acc
+            os.makedirs(SAVE_DIR, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(SAVE_DIR, "teacher_best.pt"))
 
     # Load best
     model.load_state_dict(torch.load(os.path.join(SAVE_DIR, "teacher_best.pt"),
@@ -240,16 +241,15 @@ def train_distillation(teacher, trainloader, testloader):
         scheduler.step()
 
         train_acc = 100.0 * correct / total
-        if epoch % 10 == 0 or epoch == 1:
-            test_acc = evaluate(student, testloader)
-            print(f"  Epoch {epoch:3d}/{DISTILL_EPOCHS} | "
-                  f"Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | "
-                  f"LR: {scheduler.get_last_lr()[0]:.5f}")
-            if test_acc > best_acc:
-                best_acc = test_acc
-                os.makedirs(SAVE_DIR, exist_ok=True)
-                torch.save(student.state_dict(),
-                           os.path.join(SAVE_DIR, "student_distilled.pt"))
+        test_acc = evaluate(student, testloader)
+        print(f"  Epoch {epoch:3d}/{DISTILL_EPOCHS} | "
+              f"Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | "
+              f"LR: {scheduler.get_last_lr()[0]:.5f}")
+        if test_acc > best_acc:
+            best_acc = test_acc
+            os.makedirs(SAVE_DIR, exist_ok=True)
+            torch.save(student.state_dict(),
+                       os.path.join(SAVE_DIR, "student_distilled.pt"))
 
     # Load best
     student.load_state_dict(torch.load(os.path.join(SAVE_DIR, "student_distilled.pt"),
