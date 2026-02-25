@@ -51,7 +51,6 @@ PRUNE_LR = 0.01
 QAT_EPOCHS = 150
 QAT_LR = 0.005
 QAT_BATCH = 512
-QAT_WARMUP = 10      # LR warmup epochs
 
 
 # =============================================================================
@@ -369,7 +368,7 @@ def train_pruning(student, trainloader, testloader):
 # =============================================================================
 def train_qat(pruned_model, trainloader, testloader):
     print("\n" + "#" * 60)
-    print("# Step 4: 1.58-bit QAT (BitNet b1.58) + LR Warmup")
+    print("# Step 4: 1.58-bit QAT (BitNet b1.58)")
     print("#" * 60)
 
     # Build sparsity mask from pruned model BEFORE converting to BitNet
@@ -383,13 +382,7 @@ def train_qat(pruned_model, trainloader, testloader):
     model = model.to(DEVICE)
 
     optimizer = optim.Adam(model.parameters(), lr=QAT_LR, weight_decay=1e-5)
-    # Warmup + Cosine: linear warmup for QAT_WARMUP epochs, then cosine decay
-    warmup_sched = optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.1, total_iters=QAT_WARMUP)
-    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=QAT_EPOCHS - QAT_WARMUP)
-    scheduler = optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[QAT_WARMUP])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=QAT_EPOCHS)
     criterion = nn.CrossEntropyLoss()
 
     best_acc = 0.0
@@ -421,10 +414,9 @@ def train_qat(pruned_model, trainloader, testloader):
         train_acc = 100.0 * correct / total
         if epoch % 5 == 0 or epoch == 1:
             test_acc = evaluate(model, testloader)
-            lr_now = optimizer.param_groups[0]['lr']
             print(f"  Epoch {epoch:3d}/{QAT_EPOCHS} | "
                   f"Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | "
-                  f"LR: {lr_now:.6f}")
+                  f"LR: {scheduler.get_last_lr()[0]:.6f}")
             if test_acc > best_acc:
                 best_acc = test_acc
                 os.makedirs(SAVE_DIR, exist_ok=True)
