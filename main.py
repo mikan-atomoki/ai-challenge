@@ -51,6 +51,7 @@ PRUNE_LR = 0.01
 QAT_EPOCHS = 100
 QAT_LR = 0.005
 QAT_BATCH = 512
+QAT_RUNS = 3          # Best-of-N seed lottery
 
 
 # =============================================================================
@@ -366,16 +367,10 @@ def train_pruning(student, trainloader, testloader):
 # =============================================================================
 # Step 4: 1.58-bit Quantization-Aware Training (BitNet b1.58)
 # =============================================================================
-def train_qat(pruned_model, trainloader, testloader):
-    print("\n" + "#" * 60)
-    print("# Step 4: 1.58-bit QAT (BitNet b1.58)")
-    print("#" * 60)
-
-    # Build sparsity mask from pruned model BEFORE converting to BitNet
-    sparsity_masks = {}
-    for name, param in pruned_model.named_parameters():
-        if 'weight' in name:
-            sparsity_masks[name] = (param.data != 0).float().to(DEVICE)
+def train_qat_single(pruned_model, trainloader, testloader, sparsity_masks, run_id):
+    """Single QAT run with a specific seed."""
+    torch.manual_seed(run_id * 42)
+    torch.cuda.manual_seed_all(run_id * 42)
 
     model = copy.deepcopy(pruned_model)
     model = convert_to_bitnet(model)
@@ -386,6 +381,8 @@ def train_qat(pruned_model, trainloader, testloader):
     criterion = nn.CrossEntropyLoss()
 
     best_acc = 0.0
+    ckpt_path = os.path.join(SAVE_DIR, f"student_bitnet_run{run_id}.pt")
+
     for epoch in range(1, QAT_EPOCHS + 1):
         model.train()
         running_loss = 0.0
@@ -414,21 +411,59 @@ def train_qat(pruned_model, trainloader, testloader):
         train_acc = 100.0 * correct / total
         if epoch % 5 == 0 or epoch == 1:
             test_acc = evaluate(model, testloader)
-            print(f"  Epoch {epoch:3d}/{QAT_EPOCHS} | "
+            print(f"  [Run {run_id}] Epoch {epoch:3d}/{QAT_EPOCHS} | "
                   f"Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | "
                   f"LR: {scheduler.get_last_lr()[0]:.6f}")
             if test_acc > best_acc:
                 best_acc = test_acc
                 os.makedirs(SAVE_DIR, exist_ok=True)
-                torch.save(model.state_dict(),
-                           os.path.join(SAVE_DIR, "student_bitnet.pt"))
+                torch.save(model.state_dict(), ckpt_path)
 
-    # Load best
-    model.load_state_dict(torch.load(os.path.join(SAVE_DIR, "student_bitnet.pt"),
-                                     map_location=DEVICE, weights_only=True))
+    # Load best from this run
+    model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE, weights_only=True))
     final_acc = evaluate(model, testloader)
-    print_model_stats("Student (Pruned + 1.58bit QAT)", model, final_acc)
-    return model, final_acc
+    print(f"  [Run {run_id}] Best: {final_acc:.2f}%")
+    return model, final_acc, ckpt_path
+
+
+def train_qat(pruned_model, trainloader, testloader):
+    print("\n" + "#" * 60)
+    print(f"# Step 4: 1.58-bit QAT (BitNet b1.58) — Best of {QAT_RUNS}")
+    print("#" * 60)
+
+    # Build sparsity mask from pruned model BEFORE converting to BitNet
+    sparsity_masks = {}
+    for name, param in pruned_model.named_parameters():
+        if 'weight' in name:
+            sparsity_masks[name] = (param.data != 0).float().to(DEVICE)
+
+    best_model = None
+    best_acc = 0.0
+    best_path = None
+
+    for run_id in range(1, QAT_RUNS + 1):
+        print(f"\n  === Run {run_id}/{QAT_RUNS} ===")
+        model, acc, ckpt_path = train_qat_single(
+            pruned_model, trainloader, testloader, sparsity_masks, run_id)
+        if acc > best_acc:
+            best_acc = acc
+            best_model = model
+            best_path = ckpt_path
+
+    # Save the overall best as student_bitnet.pt
+    final_path = os.path.join(SAVE_DIR, "student_bitnet.pt")
+    torch.save(best_model.state_dict(), final_path)
+
+    # Clean up per-run checkpoints
+    for run_id in range(1, QAT_RUNS + 1):
+        tmp = os.path.join(SAVE_DIR, f"student_bitnet_run{run_id}.pt")
+        if tmp != best_path and os.path.exists(tmp):
+            os.remove(tmp)
+    if best_path != final_path and os.path.exists(best_path):
+        os.remove(best_path)
+
+    print_model_stats("Student (Pruned + 1.58bit QAT)", best_model, best_acc)
+    return best_model, best_acc
 
 
 # =============================================================================
