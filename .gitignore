@@ -27,3 +27,9 @@ Desktop.ini
 # Environment variables
 .env
 .env.local
+
+# Model checkpoints & data
+models/
+checkpoints/
+data/
+*.pt

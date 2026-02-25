@@ -358,6 +358,12 @@ def train_qat(pruned_model, trainloader, testloader):
     print("# Step 4: 1.58-bit QAT (BitNet b1.58)")
     print("#" * 60)
 
+    # Build sparsity mask from pruned model BEFORE converting to BitNet
+    sparsity_masks = {}
+    for name, param in pruned_model.named_parameters():
+        if 'weight' in name:
+            sparsity_masks[name] = (param.data != 0).float().to(DEVICE)
+
     model = copy.deepcopy(pruned_model)
     model = convert_to_bitnet(model)
     model = model.to(DEVICE)
@@ -379,6 +385,12 @@ def train_qat(pruned_model, trainloader, testloader):
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+
+            # Re-apply sparsity mask to keep pruned weights at zero
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if name in sparsity_masks:
+                        param.data.mul_(sparsity_masks[name])
 
             running_loss += loss.item() * images.size(0)
             _, predicted = outputs.max(1)
