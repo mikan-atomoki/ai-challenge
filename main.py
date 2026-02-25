@@ -3,13 +3,15 @@ CIFAR-10 Extreme Compression Pipeline
 ======================================
 1. Teacher Training   : WideResNet-28-10
 2. Knowledge Distill. : Teacher -> ResNet-20 (Student)
-3. Pruning            : Iterative magnitude pruning (50%->70%->90%->95%)
+3. Pruning            : Iterative magnitude pruning (30%->50%->70%->80%)
 4. 1.58-bit QAT       : BitNet b1.58 quantization-aware training
 """
 
 import os
 import copy
 import time
+import gzip
+import io
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -41,12 +43,12 @@ DISTILL_T = 4.0      # Temperature
 DISTILL_ALPHA = 0.7   # KL weight
 
 # Pruning
-PRUNE_STAGES = [0.50, 0.70, 0.90, 0.95]
-PRUNE_FINETUNE_EPOCHS = 20
+PRUNE_STAGES = [0.30, 0.50, 0.70, 0.80]
+PRUNE_FINETUNE_EPOCHS = 30
 PRUNE_LR = 0.01
 
 # QAT (1.58bit)
-QAT_EPOCHS = 50
+QAT_EPOCHS = 100
 QAT_LR = 0.005
 QAT_BATCH = 512
 
@@ -119,6 +121,17 @@ def model_size_mb(model):
     size = os.path.getsize(tmp_path) / (1024 * 1024)
     os.remove(tmp_path)
     return size
+
+
+def model_size_gz_mb(model):
+    """Model size in MB after gzip compression."""
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    raw = buffer.getvalue()
+    gz_buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=gz_buffer, mode="wb") as f:
+        f.write(raw)
+    return len(gz_buffer.getvalue()) / (1024 * 1024)
 
 
 def compute_sparsity(model):
@@ -346,7 +359,7 @@ def train_pruning(student, trainloader, testloader):
     final_acc = evaluate(model, testloader)
     os.makedirs(SAVE_DIR, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(SAVE_DIR, "student_pruned.pt"))
-    print_model_stats("Student (Pruned 95%)", model, final_acc)
+    print_model_stats("Student (Pruned 80%)", model, final_acc)
     return model, final_acc
 
 
@@ -422,18 +435,21 @@ def train_qat(pruned_model, trainloader, testloader):
 # Final Summary
 # =============================================================================
 def print_summary(results):
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 85)
     print("  FINAL COMPARISON SUMMARY")
-    print("=" * 70)
-    header = f"  {'Stage':<35} {'Acc':>7} {'Params':>12} {'Sparsity':>9} {'Size(MB)':>9}"
+    print("=" * 85)
+    header = (f"  {'Stage':<35} {'Acc':>7} {'Params':>12} "
+              f"{'Sparsity':>9} {'Size(MB)':>9} {'Gzip(MB)':>9}")
     print(header)
-    print("  " + "-" * 66)
+    print("  " + "-" * 81)
     for name, acc, model in results:
         nonzero, total = count_nonzero_parameters(model)
         sparsity = compute_sparsity(model)
         size = model_size_mb(model)
-        print(f"  {name:<35} {acc:>6.2f}% {total:>12,} {sparsity:>8.1f}% {size:>8.2f}")
-    print("=" * 70)
+        gz_size = model_size_gz_mb(model)
+        print(f"  {name:<35} {acc:>6.2f}% {total:>12,} "
+              f"{sparsity:>8.1f}% {size:>8.2f} {gz_size:>8.2f}")
+    print("=" * 85)
 
 
 # =============================================================================
@@ -479,10 +495,10 @@ def main():
         pruned_model = ResNet20(num_classes=10).to(DEVICE)
         pruned_model.load_state_dict(torch.load(pruned_ckpt, map_location=DEVICE, weights_only=True))
         pruned_acc = evaluate(pruned_model, testloader)
-        print_model_stats("Student (Pruned 95%) [loaded]", pruned_model, pruned_acc)
+        print_model_stats("Student (Pruned 80%) [loaded]", pruned_model, pruned_acc)
     else:
         pruned_model, pruned_acc = train_pruning(student, trainloader, testloader)
-    results.append(("Student (Pruned 95%)", pruned_acc, pruned_model))
+    results.append(("Student (Pruned 80%)", pruned_acc, pruned_model))
 
     # Step 4: 1.58-bit QAT
     bitnet_ckpt = os.path.join(SAVE_DIR, "student_bitnet.pt")
@@ -503,7 +519,7 @@ def main():
     # Export: 全部入り .pt（モデル構造 + 重み + メタ情報）
     export_path = os.path.join(SAVE_DIR, "cifar10_compressed_all_in_one.pt")
     nonzero, total = count_nonzero_parameters(bitnet_model)
-    torch.save({
+    payload = {
         "model_state_dict": bitnet_model.state_dict(),
         "architecture": "ResNet-20 + BitNet b1.58",
         "compression": {
@@ -515,9 +531,20 @@ def main():
         "params_total": total,
         "params_nonzero": nonzero,
         "sparsity": compute_sparsity(bitnet_model),
-    }, export_path)
-    size = os.path.getsize(export_path) / (1024 * 1024)
-    print(f"\n[EXPORT] All-in-one model saved: {export_path} ({size:.2f} MB)")
+    }
+    # 非圧縮で保存
+    torch.save(payload, export_path)
+    raw_size = os.path.getsize(export_path) / (1024 * 1024)
+    # gzip圧縮版も保存
+    gz_path = export_path + ".gz"
+    buffer = io.BytesIO()
+    torch.save(payload, buffer)
+    with gzip.open(gz_path, "wb") as f:
+        f.write(buffer.getvalue())
+    gz_size = os.path.getsize(gz_path) / (1024 * 1024)
+    print(f"\n[EXPORT] All-in-one model saved: {export_path}")
+    print(f"         Raw size : {raw_size:.2f} MB")
+    print(f"         Gzip size: {gz_size:.2f} MB ({raw_size/gz_size:.1f}x compression)")
 
     elapsed = time.time() - start_time
     print(f"\nTotal time: {elapsed/3600:.1f} hours ({elapsed:.0f} seconds)")
