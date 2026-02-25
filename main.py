@@ -51,6 +51,8 @@ PRUNE_LR = 0.01
 QAT_EPOCHS = 100
 QAT_LR = 0.005
 QAT_BATCH = 512
+QAT_T = 4.0          # KD temperature during QAT
+QAT_ALPHA = 0.3      # KL weight during QAT (low: CE-dominant + soft hint)
 
 
 # =============================================================================
@@ -366,10 +368,12 @@ def train_pruning(student, trainloader, testloader):
 # =============================================================================
 # Step 4: 1.58-bit Quantization-Aware Training (BitNet b1.58)
 # =============================================================================
-def train_qat(pruned_model, trainloader, testloader):
+def train_qat(pruned_model, teacher, trainloader, testloader):
     print("\n" + "#" * 60)
-    print("# Step 4: 1.58-bit QAT (BitNet b1.58)")
+    print("# Step 4: 1.58-bit QAT (BitNet b1.58) + KD from Teacher")
     print("#" * 60)
+
+    teacher.eval()
 
     # Build sparsity mask from pruned model BEFORE converting to BitNet
     sparsity_masks = {}
@@ -394,8 +398,14 @@ def train_qat(pruned_model, trainloader, testloader):
         for images, labels in trainloader:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
+
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            with torch.no_grad():
+                teacher_logits = teacher(images)
+
+            # KD loss: soft label from Teacher + hard label
+            loss = distill_loss(outputs, teacher_logits, labels,
+                                T=QAT_T, alpha=QAT_ALPHA)
             loss.backward()
             optimizer.step()
 
@@ -510,7 +520,7 @@ def main():
         bitnet_acc = evaluate(bitnet_model, testloader)
         print_model_stats("Student (Pruned + 1.58bit QAT) [loaded]", bitnet_model, bitnet_acc)
     else:
-        bitnet_model, bitnet_acc = train_qat(pruned_model, trainloader, testloader)
+        bitnet_model, bitnet_acc = train_qat(pruned_model, teacher, trainloader, testloader)
     results.append(("Student (Pruned + 1.58bit)", bitnet_acc, bitnet_model))
 
     # Summary
