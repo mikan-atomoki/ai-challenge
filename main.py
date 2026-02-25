@@ -48,11 +48,11 @@ PRUNE_FINETUNE_EPOCHS = 30
 PRUNE_LR = 0.01
 
 # QAT (1.58bit)
-QAT_EPOCHS = 100
+QAT_EPOCHS = 150
 QAT_LR = 0.005
 QAT_BATCH = 512
-QAT_T = 4.0          # KD temperature during QAT
-QAT_ALPHA = 0.3      # KL weight during QAT (low: CE-dominant + soft hint)
+QAT_WARMUP = 10      # LR warmup epochs
+QAT_MIXUP_ALPHA = 0.2  # Mixup interpolation strength
 
 
 # =============================================================================
@@ -368,12 +368,21 @@ def train_pruning(student, trainloader, testloader):
 # =============================================================================
 # Step 4: 1.58-bit Quantization-Aware Training (BitNet b1.58)
 # =============================================================================
-def train_qat(pruned_model, teacher, trainloader, testloader):
-    print("\n" + "#" * 60)
-    print("# Step 4: 1.58-bit QAT (BitNet b1.58) + KD from Teacher")
-    print("#" * 60)
+def mixup_data(x, y, alpha=0.2):
+    """Mixup: interpolate between random pairs in the batch."""
+    if alpha <= 0:
+        return x, y, y, 0.0
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    return mixed_x, y, y[index], lam
 
-    teacher.eval()
+
+def train_qat(pruned_model, trainloader, testloader):
+    print("\n" + "#" * 60)
+    print("# Step 4: 1.58-bit QAT (BitNet b1.58) + Mixup + Warmup")
+    print("#" * 60)
 
     # Build sparsity mask from pruned model BEFORE converting to BitNet
     sparsity_masks = {}
@@ -386,7 +395,13 @@ def train_qat(pruned_model, teacher, trainloader, testloader):
     model = model.to(DEVICE)
 
     optimizer = optim.Adam(model.parameters(), lr=QAT_LR, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=QAT_EPOCHS)
+    # Warmup + Cosine: linear warmup for QAT_WARMUP epochs, then cosine decay
+    warmup_sched = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, total_iters=QAT_WARMUP)
+    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=QAT_EPOCHS - QAT_WARMUP)
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[QAT_WARMUP])
     criterion = nn.CrossEntropyLoss()
 
     best_acc = 0.0
@@ -397,15 +412,14 @@ def train_qat(pruned_model, teacher, trainloader, testloader):
         total = 0
         for images, labels in trainloader:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
+
+            # Mixup
+            mixed_images, targets_a, targets_b, lam = mixup_data(
+                images, labels, QAT_MIXUP_ALPHA)
+
             optimizer.zero_grad()
-
-            outputs = model(images)
-            with torch.no_grad():
-                teacher_logits = teacher(images)
-
-            # KD loss: soft label from Teacher + hard label
-            loss = distill_loss(outputs, teacher_logits, labels,
-                                T=QAT_T, alpha=QAT_ALPHA)
+            outputs = model(mixed_images)
+            loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
             loss.backward()
             optimizer.step()
 
@@ -418,15 +432,16 @@ def train_qat(pruned_model, teacher, trainloader, testloader):
             running_loss += loss.item() * images.size(0)
             _, predicted = outputs.max(1)
             total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            correct += predicted.eq(targets_a).sum().item()
         scheduler.step()
 
         train_acc = 100.0 * correct / total
         if epoch % 5 == 0 or epoch == 1:
             test_acc = evaluate(model, testloader)
+            lr_now = optimizer.param_groups[0]['lr']
             print(f"  Epoch {epoch:3d}/{QAT_EPOCHS} | "
                   f"Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | "
-                  f"LR: {scheduler.get_last_lr()[0]:.6f}")
+                  f"LR: {lr_now:.6f}")
             if test_acc > best_acc:
                 best_acc = test_acc
                 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -520,7 +535,7 @@ def main():
         bitnet_acc = evaluate(bitnet_model, testloader)
         print_model_stats("Student (Pruned + 1.58bit QAT) [loaded]", bitnet_model, bitnet_acc)
     else:
-        bitnet_model, bitnet_acc = train_qat(pruned_model, teacher, trainloader, testloader)
+        bitnet_model, bitnet_acc = train_qat(pruned_model, trainloader, testloader)
     results.append(("Student (Pruned + 1.58bit)", bitnet_acc, bitnet_model))
 
     # Summary
